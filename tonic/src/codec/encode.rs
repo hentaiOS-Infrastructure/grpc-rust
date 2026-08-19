@@ -157,6 +157,36 @@ where
     }
 }
 
+pub(crate) fn encode_unary<T>(
+    mut encoder: T,
+    item: T::Item,
+    compression_encoding: Option<CompressionEncoding>,
+    max_message_size: Option<usize>,
+) -> Result<Bytes, Status>
+where
+    T: Encoder<Error = Status>,
+{
+    let buffer_settings = encoder.buffer_settings();
+    let mut buf = BytesMut::with_capacity(buffer_settings.buffer_size);
+    let mut uncompression_buf = if compression_encoding.is_some() {
+        BytesMut::with_capacity(buffer_settings.buffer_size)
+    } else {
+        BytesMut::new()
+    };
+
+    encode_item(
+        &mut encoder,
+        &mut buf,
+        &mut uncompression_buf,
+        compression_encoding,
+        max_message_size,
+        buffer_settings,
+        item,
+    )?;
+
+    Ok(buf.freeze())
+}
+
 fn encode_item<T>(
     encoder: &mut T,
     buf: &mut BytesMut,
@@ -186,10 +216,7 @@ where
         let uncompressed_len = uncompression_buf.len();
 
         compress(
-            CompressionSettings {
-                encoding,
-                buffer_growth_interval: buffer_settings.buffer_size,
-            },
+            CompressionSettings { encoding, buffer_growth_interval: buffer_settings.buffer_size },
             uncompression_buf,
             buf,
             uncompressed_len,
@@ -290,11 +317,7 @@ impl<T: Encoder, U: Stream> EncodeBody<T, U> {
                 SingleMessageCompressionOverride::default(),
                 max_message_size,
             ),
-            state: EncodeState {
-                error: None,
-                role: Role::Client,
-                is_end_stream: false,
-            },
+            state: EncodeState { error: None, role: Role::Client, is_end_stream: false },
             cancellation_fut,
         }
     }
@@ -316,11 +339,7 @@ impl<T: Encoder, U: Stream> EncodeBody<T, U> {
                 compression_override,
                 max_message_size,
             ),
-            state: EncodeState {
-                error: None,
-                role: Role::Server,
-                is_end_stream: false,
-            },
+            state: EncodeState { error: None, role: Role::Server, is_end_stream: false },
             cancellation_fut: None,
         }
     }
@@ -336,11 +355,8 @@ impl EncodeState {
                 }
 
                 self.is_end_stream = true;
-                let status = if let Some(status) = self.error.take() {
-                    status
-                } else {
-                    Status::ok("")
-                };
+                let status =
+                    if let Some(status) = self.error.take() { status } else { Status::ok("") };
                 Some(status.to_header_map())
             }
         }
@@ -391,11 +407,7 @@ where
                     Some(Ok(Frame::trailers(status.to_header_map()?))).into()
                 }
             },
-            None => self_proj
-                .state
-                .trailers()
-                .map(|t| t.map(Frame::trailers))
-                .into(),
+            None => self_proj.state.trailers().map(|t| t.map(Frame::trailers)).into(),
         }
     }
 }

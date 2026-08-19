@@ -26,14 +26,14 @@ use crate::codec::EncodeBody;
 use crate::codec::{CompressionEncoding, EnabledCompressionEncodings};
 use crate::metadata::GRPC_CONTENT_TYPE;
 use crate::{
-    Code, Request, Response, Status,
     body::Body,
     client::GrpcService,
-    codec::{Codec, Decoder, Streaming},
+    codec::{encode_unary, Codec, Decoder, Streaming},
     request::SanitizeHeaders,
+    Code, Request, Response, Status,
 };
 use http::{
-    header::{CONTENT_TYPE, HeaderValue, TE},
+    header::{HeaderValue, CONTENT_LENGTH, CONTENT_TYPE, TE},
     uri::{PathAndQuery, Uri},
 };
 use http_body::Body as HttpBody;
@@ -232,7 +232,7 @@ impl<T> Grpc<T> {
         &mut self,
         request: Request<M1>,
         path: PathAndQuery,
-        codec: C,
+        mut codec: C,
     ) -> Result<Response<M2>, Status>
     where
         T: GrpcService<Body>,
@@ -242,8 +242,48 @@ impl<T> Grpc<T> {
         M1: Send + Sync + 'static,
         M2: Send + Sync + 'static,
     {
-        let request = request.map(|m| tokio_stream::once(m));
-        self.client_streaming(request, path, codec).await
+        // Unary requests contain exactly one message, so encode it up front.
+        // This gives us the exact HTTP body size and allows us to emit a
+        // Content-Length header instead of treating the request as an
+        // unknown-length stream.
+        let (metadata, extensions, message) = request.into_parts();
+        let encoded = encode_unary(
+            codec.encoder(),
+            message,
+            self.config.send_compression_encodings,
+            self.config.max_encoding_message_size,
+        )?;
+        let content_length = HeaderValue::from_bytes(encoded.len().to_string().as_bytes())
+            .expect("usize must form a valid Content-Length header value");
+
+        let request = Request::from_parts(
+            metadata,
+            extensions,
+            Body::new(http_body_util::Full::new(encoded)),
+        );
+        let mut request = self.config.prepare_request(request, path);
+        request.headers_mut().insert(CONTENT_LENGTH, content_length);
+
+        let response = self.inner.call(request).await.map_err(Status::from_error_generic)?;
+
+        let decoder = codec.decoder();
+        let (mut parts, body, extensions) = self.create_response(decoder, response)?.into_parts();
+        let mut body = pin!(body);
+
+        let message = body
+            .try_next()
+            .await
+            .map_err(|mut status| {
+                status.metadata_mut().merge(parts.clone());
+                status
+            })?
+            .ok_or_else(|| Status::internal("Missing response message."))?;
+
+        if let Some(trailers) = body.trailers().await? {
+            parts.merge(trailers);
+        }
+
+        Ok(Response::from_parts(parts, message, extensions))
     }
 
     /// Send a client side streaming gRPC request.
@@ -334,11 +374,7 @@ impl<T> Grpc<T> {
 
         let request = self.config.prepare_request(request, path);
 
-        let response = self
-            .inner
-            .call(request)
-            .await
-            .map_err(Status::from_error_generic)?;
+        let response = self.inner.call(request).await.map_err(Status::from_error_generic)?;
 
         let decoder = codec.decoder();
 
@@ -414,39 +450,28 @@ impl GrpcConfig {
 
         let uri = Uri::from_parts(parts).expect("path_and_query only is valid Uri");
 
-        let mut request = request.into_http(
-            uri,
-            http::Method::POST,
-            http::Version::HTTP_2,
-            SanitizeHeaders::Yes,
-        );
+        let mut request =
+            request.into_http(uri, http::Method::POST, http::Version::HTTP_2, SanitizeHeaders::Yes);
 
         // Add the gRPC related HTTP headers
-        request
-            .headers_mut()
-            .insert(TE, HeaderValue::from_static("trailers"));
+        request.headers_mut().insert(TE, HeaderValue::from_static("trailers"));
 
         // Set the content type
-        request
-            .headers_mut()
-            .insert(CONTENT_TYPE, GRPC_CONTENT_TYPE);
+        request.headers_mut().insert(CONTENT_TYPE, GRPC_CONTENT_TYPE);
 
         #[cfg(any(feature = "gzip", feature = "deflate", feature = "zstd"))]
         if let Some(encoding) = self.send_compression_encodings {
-            request.headers_mut().insert(
-                crate::codec::compression::ENCODING_HEADER,
-                encoding.into_header_value(),
-            );
+            request
+                .headers_mut()
+                .insert(crate::codec::compression::ENCODING_HEADER, encoding.into_header_value());
         }
 
-        if let Some(header_value) = self
-            .accept_compression_encodings
-            .into_accept_encoding_header_value()
+        if let Some(header_value) =
+            self.accept_compression_encodings.into_accept_encoding_header_value()
         {
-            request.headers_mut().insert(
-                crate::codec::compression::ACCEPT_ENCODING_HEADER,
-                header_value,
-            );
+            request
+                .headers_mut()
+                .insert(crate::codec::compression::ACCEPT_ENCODING_HEADER, header_value);
         }
 
         request
@@ -473,22 +498,10 @@ impl<T: fmt::Debug> fmt::Debug for Grpc<T> {
         f.debug_struct("Grpc")
             .field("inner", &self.inner)
             .field("origin", &self.config.origin)
-            .field(
-                "compression_encoding",
-                &self.config.send_compression_encodings,
-            )
-            .field(
-                "accept_compression_encodings",
-                &self.config.accept_compression_encodings,
-            )
-            .field(
-                "max_decoding_message_size",
-                &self.config.max_decoding_message_size,
-            )
-            .field(
-                "max_encoding_message_size",
-                &self.config.max_encoding_message_size,
-            )
+            .field("compression_encoding", &self.config.send_compression_encodings)
+            .field("accept_compression_encodings", &self.config.accept_compression_encodings)
+            .field("max_decoding_message_size", &self.config.max_decoding_message_size)
+            .field("max_encoding_message_size", &self.config.max_encoding_message_size)
             .finish()
     }
 }

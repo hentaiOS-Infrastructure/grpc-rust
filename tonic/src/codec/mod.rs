@@ -36,6 +36,7 @@ use std::io;
 pub use self::buffer::{DecodeBuf, EncodeBuf};
 pub use self::compression::{CompressionEncoding, EnabledCompressionEncodings};
 pub use self::decode::Streaming;
+pub(crate) use self::encode::encode_unary;
 pub use self::encode::EncodeBody;
 
 // Doc hidden since this is used in a test in another crate, we can expose this publically later
